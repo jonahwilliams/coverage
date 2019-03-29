@@ -3,11 +3,25 @@
 // BSD-style license that can be found in the LICENSE file.
 
 import 'dart:async';
+import 'dart:io';
 
-import 'package:vm_service_client/vm_service_client.dart';
+import 'package:vm_service_lib/vm_service_lib.dart';
 import 'util.dart';
 
 const _retryInterval = const Duration(milliseconds: 200);
+
+Future<VmService> _vmServiceConnectUri(
+  String wsUri, {
+  Log log,
+  CompressionOptions compression = CompressionOptions.compressionOff,
+}) async {
+  WebSocket socket = await WebSocket.connect(wsUri, compression: compression);
+  StreamController<String> controller = new StreamController();
+  socket.listen((dynamic data) => controller.add(data));
+  return new VmService(
+      controller.stream, (String message) => socket.add(message),
+      log: log, disposeHandler: () => socket.close());
+}
 
 /// Collects coverage for all isolates in the running VM.
 ///
@@ -23,9 +37,14 @@ const _retryInterval = const Duration(milliseconds: 200);
 ///
 /// If [waitPaused] is true, collection will not begin until all isolates are
 /// in the paused state.
+///
+/// [compression] allows specificying the [CompressionOptions] for the
+/// websocket used to connect to the vm service. Defaults to
+/// [CompressionOptions.compressionOff].
 Future<Map<String, dynamic>> collect(
     Uri serviceUri, bool resume, bool waitPaused,
-    {Duration timeout}) async {
+    {Duration timeout,
+    CompressionOptions compression = CompressionOptions.compressionOff}) async {
   if (serviceUri == null) throw ArgumentError('serviceUri must not be null');
 
   // Create websocket URI. Handle any trailing slashes.
@@ -33,13 +52,14 @@ Future<Map<String, dynamic>> collect(
     ..add('ws');
   var uri = serviceUri.replace(scheme: 'ws', pathSegments: pathSegments);
 
-  VMServiceClient vmService;
+  VmService vmService;
   await retry(() async {
     try {
-      vmService = new VMServiceClient.connect(uri);
+      vmService =
+          await _vmServiceConnectUri(uri.toString(), compression: compression);
       await vmService.getVM().timeout(_retryInterval);
     } on TimeoutException {
-      vmService.close();
+      vmService.dispose();
       rethrow;
     }
   }, _retryInterval, timeout: timeout);
@@ -53,39 +73,46 @@ Future<Map<String, dynamic>> collect(
     if (resume) {
       await _resumeIsolates(vmService);
     }
-    await vmService.close();
+    vmService.dispose();
   }
 }
 
-Future<Map<String, dynamic>> _getAllCoverage(VMServiceClient service) async {
-  var vm = await service.getVM();
+Future<Map<String, dynamic>> _getAllCoverage(VmService vmService) async {
+  final VM vm = await vmService.getVM();
   var allCoverage = <Map<String, dynamic>>[];
 
   for (var isolateRef in vm.isolates) {
-    var isolate = await isolateRef.load();
-    var report = await isolate.getSourceReport(forceCompile: true);
-    var coverage = await _getCoverageJson(service, report);
+    final SourceReport report =
+        await vmService.getSourceReport(isolateRef.id, ['Coverage']);
+    var coverage = await _getCoverageJson(vmService, report, isolateRef);
     allCoverage.addAll(coverage);
   }
   return <String, dynamic>{'type': 'CodeCoverage', 'coverage': allCoverage};
 }
 
-Future _resumeIsolates(VMServiceClient service) async {
-  var vm = await service.getVM();
+Future _resumeIsolates(VmService vmService) async {
+  final VM vm = await vmService.getVM();
   for (var isolateRef in vm.isolates) {
-    var isolate = await isolateRef.load();
-    if (isolate.isPaused) {
-      await isolateRef.resume();
+    final Isolate isolate = await vmService.getIsolate(isolateRef.id);
+    if (_isIsolatePaused(isolate)) {
+      await vmService.resume(isolate.id);
     }
   }
 }
 
-Future _waitIsolatesPaused(VMServiceClient service, {Duration timeout}) async {
+bool _isIsolatePaused(Isolate isolate) {
+  return isolate.pauseEvent.kind != EventKind.kNone &&
+      isolate.pauseEvent.kind != EventKind.kResume;
+}
+
+Future _waitIsolatesPaused(VmService vmService, {Duration timeout}) async {
   Future allPaused() async {
-    var vm = await service.getVM();
+    final VM vm = await vmService.getVM();
     for (var isolateRef in vm.isolates) {
-      var isolate = await isolateRef.load();
-      if (!isolate.isPaused) throw "Unpaused isolates remaining.";
+      final Isolate isolate = await vmService.getIsolate(isolateRef.id);
+      if (!_isIsolatePaused(isolate)) {
+        throw Exception('Unpaused isolates remaining.');
+      }
     }
   }
 
@@ -94,28 +121,34 @@ Future _waitIsolatesPaused(VMServiceClient service, {Duration timeout}) async {
 
 /// Returns a JSON coverage list backward-compatible with pre-1.16.0 SDKs.
 Future<List<Map<String, dynamic>>> _getCoverageJson(
-    VMServiceClient service, VMSourceReport report) async {
-  var scriptRefs = report.ranges.map((r) => r.script).toSet();
-  var scripts = <VMScriptRef, VMScript>{};
+    VmService service, SourceReport report, IsolateRef isolateRef) async {
+  final Set<ScriptRef> scriptRefs = report.ranges
+      .map((SourceReportRange range) => report.scripts[range.scriptIndex])
+      .toSet();
+  var scripts = <ScriptRef, Script>{};
   for (var ref in scriptRefs) {
-    scripts[ref] = await ref.load();
+    scripts[ref] = await service.getObject(isolateRef.id, ref.id);
   }
 
   // script uri -> { line -> hit count }
   var hitMaps = <Uri, Map<int, int>>{};
-  for (var range in report.ranges) {
+  for (SourceReportRange range in report.ranges) {
+    final ScriptRef scriptRef = report.scripts[range.scriptIndex];
+    final Script script = scripts[scriptRef];
+    final Uri uri = Uri.parse(script.uri);
     // Not returned in scripts section of source report.
-    if (range.script.uri.scheme == 'evaluate') continue;
+    if (uri.scheme == 'evaluate') {
+      continue;
+    }
 
-    hitMaps.putIfAbsent(range.script.uri, () => <int, int>{});
-    var hitMap = hitMaps[range.script.uri];
-    var script = scripts[range.script];
-    for (VMScriptToken hit in range.hits ?? []) {
-      var line = script.sourceLocation(hit).line + 1;
+    hitMaps.putIfAbsent(uri, () => <int, int>{});
+    var hitMap = hitMaps[uri];
+    for (int hit in range.coverage.hits ?? []) {
+      var line = script.tokenPosTable[hit][0] + 1;
       hitMap[line] = hitMap.containsKey(line) ? hitMap[line] + 1 : 1;
     }
-    for (VMScriptToken miss in range.misses ?? []) {
-      var line = script.sourceLocation(miss).line + 1;
+    for (int miss in range.coverage.misses ?? []) {
+      var line = script.tokenPosTable[miss][0] + 1;
       hitMap.putIfAbsent(line, () => 0);
     }
   }
