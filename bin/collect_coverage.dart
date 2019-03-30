@@ -20,7 +20,7 @@ Future<Null> main(List<String> arguments) async {
   var options = _parseArgs(arguments);
   await Chain.capture(() async {
     var coverage = await collect(
-        options.serviceUri, options.resume, options.waitPaused,
+        options.serviceUri, options.resume, options.waitPaused, null,
         timeout: options.timeout);
     options.out.write(json.encode(coverage));
     await options.out.close();
