@@ -133,6 +133,9 @@ Future<List<Map<String, dynamic>>> _getCoverageJson(
   // script uri -> { line -> hit count }
   var hitMaps = <Uri, Map<int, int>>{};
   for (SourceReportRange range in report.ranges) {
+    if (range.coverage == null) {
+      continue;
+    }
     final ScriptRef scriptRef = report.scripts[range.scriptIndex];
     final Script script = scripts[scriptRef];
     final Uri uri = Uri.parse(script.uri);
@@ -143,11 +146,11 @@ Future<List<Map<String, dynamic>>> _getCoverageJson(
 
     hitMaps.putIfAbsent(uri, () => <int, int>{});
     var hitMap = hitMaps[uri];
-    for (int hit in range.coverage.hits ?? []) {
+    for (int hit in range.coverage?.hits ?? []) {
       var line = _lineAndColumn(hit, script.tokenPosTable)[0];
       hitMap[line] = hitMap.containsKey(line) ? hitMap[line] + 1 : 1;
     }
-    for (int miss in range.coverage.misses ?? []) {
+    for (int miss in range.coverage?.misses ?? []) {
       var line = _lineAndColumn(miss, script.tokenPosTable)[0];
       hitMap.putIfAbsent(line, () => 0);
     }
