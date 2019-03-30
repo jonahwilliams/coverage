@@ -18,7 +18,7 @@ Future<VmService> _vmServiceConnectUri(
   WebSocket socket = await WebSocket.connect(wsUri, compression: compression);
   StreamController<String> controller = new StreamController();
   socket.listen((dynamic data) => controller.add(data));
-  return new VmService(
+  return VmService(
       controller.stream, (String message) => socket.add(message),
       log: log, disposeHandler: () => socket.close());
 }
@@ -83,7 +83,7 @@ Future<Map<String, dynamic>> _getAllCoverage(VmService vmService) async {
 
   for (var isolateRef in vm.isolates) {
     final SourceReport report =
-        await vmService.getSourceReport(isolateRef.id, ['Coverage']);
+        await vmService.getSourceReport(isolateRef.id, ['Coverage'], forceCompile: true);
     var coverage = await _getCoverageJson(vmService, report, isolateRef);
     allCoverage.addAll(coverage);
   }
