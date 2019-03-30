@@ -144,11 +144,11 @@ Future<List<Map<String, dynamic>>> _getCoverageJson(
     hitMaps.putIfAbsent(uri, () => <int, int>{});
     var hitMap = hitMaps[uri];
     for (int hit in range.coverage.hits ?? []) {
-      var line = script.tokenPosTable[hit][0] + 1;
+      var line = _lineAndColumn(hit, script.tokenPosTable)[0];
       hitMap[line] = hitMap.containsKey(line) ? hitMap[line] + 1 : 1;
     }
     for (int miss in range.coverage.misses ?? []) {
-      var line = script.tokenPosTable[miss][0] + 1;
+      var line = _lineAndColumn(miss, script.tokenPosTable)[0];
       hitMap.putIfAbsent(line, () => 0);
     }
   }
@@ -180,4 +180,23 @@ Map<String, dynamic> _toScriptCoverageJson(
   };
   json['hits'] = hits;
   return json;
+}
+
+List<int> _lineAndColumn(int position, List<List<int>> tokenPostitions) {
+  var min = 0;
+  var max = tokenPostitions.length;
+  while (min < max) {
+    var mid = min + ((max - min) >> 1);
+    var row = tokenPostitions[mid];
+    if (row[1] > position) {
+      max = mid;
+    } else {
+      for (var i = 1; i < row.length; i += 2) {
+        if (row[i] == position) return [row.first, row[i + 1]];
+      }
+
+      min = mid + 1;
+    }
+  }
+  throw StateError('Unreachable');
 }
