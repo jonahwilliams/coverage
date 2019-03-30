@@ -17,6 +17,6 @@ dependencies:
       ref: testing_root_lib
 
 
-executables:
-  collect_coverage:
-  format_coverage:
+# executables:
+#   collect_coverage:
+#   format_coverage:
