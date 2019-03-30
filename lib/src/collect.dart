@@ -24,7 +24,7 @@ const _retryInterval = const Duration(milliseconds: 200);
 /// If [waitPaused] is true, collection will not begin until all isolates are
 /// in the paused state.
 Future<Map<String, dynamic>> collect(
-    Uri serviceUri, bool resume, bool waitPaused,
+    Uri serviceUri, bool resume, bool waitPaused, String rootLibUri,
     {Duration timeout}) async {
   if (serviceUri == null) throw ArgumentError('serviceUri must not be null');
 
@@ -48,7 +48,7 @@ Future<Map<String, dynamic>> collect(
       await _waitIsolatesPaused(vmService, timeout: timeout);
     }
 
-    return await _getAllCoverage(vmService);
+    return await _getAllCoverage(vmService, rootLibUri);
   } finally {
     if (resume) {
       await _resumeIsolates(vmService);
@@ -57,13 +57,13 @@ Future<Map<String, dynamic>> collect(
   }
 }
 
-Future<Map<String, dynamic>> _getAllCoverage(VMServiceClient service) async {
+Future<Map<String, dynamic>> _getAllCoverage(VMServiceClient service, String rootLibUri) async {
   var vm = await service.getVM();
   var allCoverage = <Map<String, dynamic>>[];
 
   for (var isolateRef in vm.isolates) {
     var isolate = await isolateRef.load();
-    var report = await isolate.getSourceReport(forceCompile: true);
+    var report = await isolate.getSourceReport(forceCompile: true, rootLibUri: rootLibUri);
     var coverage = await _getCoverageJson(service, report);
     allCoverage.addAll(coverage);
   }
