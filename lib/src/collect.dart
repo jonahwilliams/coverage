@@ -56,6 +56,7 @@ Future<Map<String, dynamic>> collect(
   WebSocket webSocket;
   await retry(() async {
     try {
+      print('connecting to $uri');
       webSocket = await WebSocket.connect(uri.toString(),
           compression: CompressionOptions.compressionOff);
       var channel = IOWebSocketChannel(webSocket).cast<String>();
