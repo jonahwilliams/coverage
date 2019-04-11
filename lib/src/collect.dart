@@ -56,7 +56,6 @@ Future<Map<String, dynamic>> collect(
   WebSocket webSocket;
   await retry(() async {
     try {
-      print('connecting to $uri');
       webSocket = await WebSocket.connect(uri.toString(),
           compression: CompressionOptions.compressionOff);
       var channel = IOWebSocketChannel(webSocket).cast<String>();
@@ -115,7 +114,9 @@ Future<Map<String, dynamic>> _getAllCoverage(
           <String>['Coverage'],
           forceCompile: true,
           scriptId: scriptRef.id,
-        ));
+        ).then<void>((dynamic sourceReport) {
+          reports[scriptRef.id] = sourceReport;
+        }));
       }
       await Future.wait<void>(futures);
       var coverage = await _buildCoverageMap(reports, scripts);
