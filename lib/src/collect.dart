@@ -216,7 +216,7 @@ Future<List<Map<String, dynamic>>> _buildCoverageMap(
 
       hitMaps[uri] ??= <int, int>{};
       var hitMap = hitMaps[uri];
-      var script = scripts[range.scriptIndex];
+      var script = scripts[scriptId];
       for (int hit in range.coverage.hits ?? []) {
         var line = _lineAndColumn(hit, script.tokenPosTable).first + 1;
         hitMap[line] = hitMap.containsKey(line) ? hitMap[line] + 1 : 1;
