@@ -3,11 +3,27 @@
 // BSD-style license that can be found in the LICENSE file.
 
 import 'dart:async';
+import 'dart:io';
 
-import 'package:vm_service_client/vm_service_client.dart';
+import 'package:vm_service_lib/vm_service_lib.dart';
+import 'package:web_socket_channel/io.dart';
 import 'util.dart';
 
 const _retryInterval = const Duration(milliseconds: 200);
+
+/// Allows filtering the set of libraries for which to collect coverage.
+///
+/// By default, coverage will be collected for all libraries loaded into the
+/// Dart VM, including dart core libraries - this can have significant
+/// performance impact. It is recommended that the library predicate is used
+/// to filter out libraries that are not a part of the package under test.
+///
+/// Example:
+///
+///    bool myLibraryPredicate(String libraryUri) {
+///        return libraryUri.contains(myPackagename);
+///    }
+typedef LibraryPredicate = bool Function(String libraryUri);
 
 /// Collects coverage for all isolates in the running VM.
 ///
@@ -23,9 +39,12 @@ const _retryInterval = const Duration(milliseconds: 200);
 ///
 /// If [waitPaused] is true, collection will not begin until all isolates are
 /// in the paused state.
+///
+/// If a [libraryPredicate] is provided, only library uris for which the
+/// function returns true will have coverage collected.
 Future<Map<String, dynamic>> collect(
     Uri serviceUri, bool resume, bool waitPaused,
-    {Duration timeout}) async {
+    {Duration timeout, LibraryPredicate libraryPredicate}) async {
   if (serviceUri == null) throw ArgumentError('serviceUri must not be null');
 
   // Create websocket URI. Handle any trailing slashes.
@@ -33,13 +52,17 @@ Future<Map<String, dynamic>> collect(
     ..add('ws');
   var uri = serviceUri.replace(scheme: 'ws', pathSegments: pathSegments);
 
-  VMServiceClient vmService;
+  VmService vmService;
+  WebSocket webSocket;
   await retry(() async {
     try {
-      vmService = new VMServiceClient.connect(uri);
+      webSocket = await WebSocket.connect(uri.toString(),
+          compression: CompressionOptions.compressionOff);
+      var channel = IOWebSocketChannel(webSocket).cast<String>();
+      vmService = VmService(channel.stream, channel.sink.add);
       await vmService.getVM().timeout(_retryInterval);
     } on TimeoutException {
-      vmService.close();
+      await webSocket?.close();
       rethrow;
     }
   }, _retryInterval, timeout: timeout);
@@ -48,44 +71,77 @@ Future<Map<String, dynamic>> collect(
       await _waitIsolatesPaused(vmService, timeout: timeout);
     }
 
-    return await _getAllCoverage(vmService);
+    return await _getAllCoverage(vmService, libraryPredicate);
   } finally {
     if (resume) {
       await _resumeIsolates(vmService);
     }
-    await vmService.close();
+    await webSocket?.close();
   }
 }
 
-Future<Map<String, dynamic>> _getAllCoverage(VMServiceClient service) async {
+Future<Map<String, dynamic>> _getAllCoverage(
+    VmService service, LibraryPredicate libraryPredicate) async {
   var vm = await service.getVM();
   var allCoverage = <Map<String, dynamic>>[];
 
-  for (var isolateRef in vm.isolates) {
-    var isolate = await isolateRef.load();
-    var report = await isolate.getSourceReport(forceCompile: true);
-    var coverage = await _getCoverageJson(service, report);
-    allCoverage.addAll(coverage);
+  // If the library predicate is null, use the default collection strategy.
+  if (libraryPredicate == null) {
+    for (var isolateRef in vm.isolates) {
+      var report = await service.getSourceReport(
+          isolateRef.id, <String>['Coverage'],
+          forceCompile: true);
+      var coverage = await _getCoverageJson(isolateRef, service, report);
+      allCoverage.addAll(coverage);
+    }
+  } else {
+    for (var isolateRef in vm.isolates) {
+      var futures = <Future>[];
+      var scripts = <String, Script>{};
+      var reports = <String, SourceReport>{};
+      var scriptList = await service.getScripts(isolateRef.id);
+      for (var scriptRef in scriptList.scripts) {
+        if (!libraryPredicate(scriptRef.uri)) {
+          continue;
+        }
+        futures.add(service
+            .getObject(isolateRef.id, scriptRef.id)
+            .then<void>((dynamic script) {
+          scripts[scriptRef.id] = script;
+        }));
+        futures.add(service.getSourceReport(
+          isolateRef.id,
+          <String>['Coverage'],
+          forceCompile: true,
+          scriptId: scriptRef.id,
+        ));
+      }
+      await Future.wait<void>(futures);
+      var coverage = await _buildCoverageMap(reports, scripts);
+      allCoverage.addAll(coverage);
+    }
   }
   return <String, dynamic>{'type': 'CodeCoverage', 'coverage': allCoverage};
 }
 
-Future _resumeIsolates(VMServiceClient service) async {
+Future _resumeIsolates(VmService service) async {
   var vm = await service.getVM();
   for (var isolateRef in vm.isolates) {
-    var isolate = await isolateRef.load();
-    if (isolate.isPaused) {
-      await isolateRef.resume();
+    Isolate isolate = await service.getIsolate(isolateRef.id);
+    if (isolate?.pauseEvent?.type != EventKind.kResume) {
+      await service.resume(isolateRef.id);
     }
   }
 }
 
-Future _waitIsolatesPaused(VMServiceClient service, {Duration timeout}) async {
+Future _waitIsolatesPaused(VmService service, {Duration timeout}) async {
   Future allPaused() async {
     var vm = await service.getVM();
     for (var isolateRef in vm.isolates) {
-      var isolate = await isolateRef.load();
-      if (!isolate.isPaused) throw "Unpaused isolates remaining.";
+      Isolate isolate = await service.getIsolate(isolateRef.id);
+      if (isolate?.pauseEvent?.type == EventKind.kResume) {
+        throw Exception('Unpaused isolates remaining.');
+      }
     }
   }
 
@@ -94,29 +150,41 @@ Future _waitIsolatesPaused(VMServiceClient service, {Duration timeout}) async {
 
 /// Returns a JSON coverage list backward-compatible with pre-1.16.0 SDKs.
 Future<List<Map<String, dynamic>>> _getCoverageJson(
-    VMServiceClient service, VMSourceReport report) async {
-  var scriptRefs = report.ranges.map((r) => r.script).toSet();
-  var scripts = <VMScriptRef, VMScript>{};
-  for (var ref in scriptRefs) {
-    scripts[ref] = await ref.load();
+    IsolateRef isolateRef, VmService service, SourceReport report) async {
+  var scriptIndexes =
+      report.ranges.map((SourceReportRange range) => range.scriptIndex).toSet();
+  var scripts = <int, Script>{};
+  var futures = <Future>[];
+  for (var index in scriptIndexes) {
+    var scriptRef = report.scripts[index];
+    futures.add(service
+        .getObject(isolateRef.id, scriptRef.id)
+        .then<void>((dynamic script) {
+      scripts[index] = script;
+    }));
   }
+  await Future.wait<void>(futures);
 
   // script uri -> { line -> hit count }
   var hitMaps = <Uri, Map<int, int>>{};
   for (var range in report.ranges) {
     // Not returned in scripts section of source report.
-    if (range.script.uri.scheme == 'evaluate') continue;
+    var scriptRef = report.scripts[range.scriptIndex];
+    var uri = Uri.parse(scriptRef.uri);
+    if (uri.scheme == 'evaluate') {
+      continue;
+    }
 
-    hitMaps.putIfAbsent(range.script.uri, () => <int, int>{});
-    var hitMap = hitMaps[range.script.uri];
-    var script = scripts[range.script];
-    for (VMScriptToken hit in range.hits ?? []) {
-      var line = script.sourceLocation(hit).line + 1;
+    hitMaps[uri] ??= <int, int>{};
+    var hitMap = hitMaps[uri];
+    var script = scripts[range.scriptIndex];
+    for (int hit in range.coverage.hits ?? []) {
+      var line = _lineAndColumn(hit, script.tokenPosTable).first + 1;
       hitMap[line] = hitMap.containsKey(line) ? hitMap[line] + 1 : 1;
     }
-    for (VMScriptToken miss in range.misses ?? []) {
-      var line = script.sourceLocation(miss).line + 1;
-      hitMap.putIfAbsent(line, () => 0);
+    for (int miss in range.coverage.hits ?? []) {
+      var line = _lineAndColumn(miss, script.tokenPosTable).first + 1;
+      hitMap[line] ??= 0;
     }
   }
 
@@ -126,6 +194,64 @@ Future<List<Map<String, dynamic>>> _getCoverageJson(
     coverage.add(_toScriptCoverageJson(uri, hitMap));
   });
   return coverage;
+}
+
+Future<List<Map<String, dynamic>>> _buildCoverageMap(
+  Map<String, SourceReport> sourceReports,
+  Map<String, Script> scripts,
+) async {
+  var hitMaps = <Uri, Map<int, int>>{};
+  for (String scriptId in scripts.keys) {
+    var report = sourceReports[scriptId];
+    // script uri -> { line -> hit count }
+    for (var range in report.ranges) {
+      // Not returned in scripts section of source report.
+      var scriptRef = report.scripts[range.scriptIndex];
+      var uri = Uri.parse(scriptRef.uri);
+      if (uri.scheme == 'evaluate') {
+        continue;
+      }
+
+      hitMaps[uri] ??= <int, int>{};
+      var hitMap = hitMaps[uri];
+      var script = scripts[range.scriptIndex];
+      for (int hit in range.coverage.hits ?? []) {
+        var line = _lineAndColumn(hit, script.tokenPosTable).first + 1;
+        hitMap[line] = hitMap.containsKey(line) ? hitMap[line] + 1 : 1;
+      }
+      for (int miss in range.coverage.hits ?? []) {
+        var line = _lineAndColumn(miss, script.tokenPosTable).first + 1;
+        hitMap[line] ??= 0;
+      }
+    }
+  }
+  // Output JSON
+  var coverage = <Map<String, dynamic>>[];
+  hitMaps.forEach((uri, hitMap) {
+    coverage.add(_toScriptCoverageJson(uri, hitMap));
+  });
+  return coverage;
+}
+
+// Binary search the token position table for the line and column information.
+List<int> _lineAndColumn(int position, List<dynamic> tokenPositions) {
+  var min = 0;
+  var max = tokenPositions.length;
+  while (min < max) {
+    var mid = min + ((max - min) >> 1);
+    List<dynamic> row = tokenPositions[mid];
+    if (row[1] > position) {
+      max = mid;
+    } else {
+      for (int i = 1; i < row.length; i += 2) {
+        if (row[i] == position) {
+          return <int>[row.first, row[i + 1]];
+        }
+      }
+      min = mid + 1;
+    }
+  }
+  throw StateError('Unreachable');
 }
 
 /// Returns a JSON hit map backward-compatible with pre-1.16.0 SDKs.
